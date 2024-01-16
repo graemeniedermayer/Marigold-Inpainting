@@ -1,6 +1,11 @@
-# Bad Inpainting Marigold: Repurposing Diffusion-Based Image Generators for Monocular Depth Estimation
+# Bad Inpainting Marigold
 
 This is an attempt to add inpainting to marigold (currently not fully fuctional).
+
+
+
+-----
+# From Original Repo
 
 [![Website](doc/badges/badge-website.svg)](https://marigoldmonodepth.github.io)
 [![Paper](https://img.shields.io/badge/arXiv-PDF-b31b1b)](https://arxiv.org/abs/2312.02145)
