@@ -1,8 +1,15 @@
 # Bad Inpainting Marigold
 
-This is an attempt to add inpainting to marigold (currently not fully fuctional).
+This is an attempt to add inpainting to marigold (currently not fully accurate).
 
+Example usage
 
+```bash
+python run.py --input_rgb_dir data/inputdir \
+--input_mask maskimage.png --input_depth depthimage.png \
+--output_dir output/outputdir --half_precision --processing_res 768
+```
+Depth image should be rgb grey (from marigold)
 
 -----
 # From Original Repo
