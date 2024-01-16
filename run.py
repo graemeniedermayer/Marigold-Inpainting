@@ -58,6 +58,20 @@ if "__main__" == __name__:
     )
 
     parser.add_argument(
+        "--input_mask",
+        type=str,
+        required=True,
+        help="Path to the input mask image.",
+    )
+
+    parser.add_argument(
+        "--input_depth",
+        type=str,
+        required=True,
+        help="Path to the input depth image.",
+    )
+
+    parser.add_argument(
         "--output_dir", type=str, required=True, help="Output directory."
     )
 
@@ -66,7 +80,7 @@ if "__main__" == __name__:
         "--denoise_steps",
         type=int,
         default=10,
-        help="Diffusion denoising steps, more steps results in higher accuracy but slower inference speed.",
+        help="Diffusion denoising steps, more stepts results in higher accuracy but slower inference speed.",
     )
     parser.add_argument(
         "--ensemble_size",
@@ -119,12 +133,14 @@ if "__main__" == __name__:
 
     checkpoint_path = args.checkpoint
     input_rgb_dir = args.input_rgb_dir
+    input_mask = args.input_mask
+    input_depth = args.input_depth
     output_dir = args.output_dir
 
     denoise_steps = args.denoise_steps
     ensemble_size = args.ensemble_size
     if ensemble_size > 15:
-        logging.warning("Running with large ensemble size will be slow.")
+        logging.warning(f"Running with large ensemble size will be slow.")
     half_precision = args.half_precision
 
     processing_res = args.processing_res
@@ -183,6 +199,8 @@ if "__main__" == __name__:
         logging.error(f"No image found in '{input_rgb_dir}'")
         exit(1)
 
+    # -------------------- Depth --------------------
+
     # -------------------- Model --------------------
     if half_precision:
         dtype = torch.float16
@@ -193,6 +211,7 @@ if "__main__" == __name__:
     pipe = MarigoldPipeline.from_pretrained(checkpoint_path, torch_dtype=dtype)
 
     try:
+        import xformers
 
         pipe.enable_xformers_memory_efficient_attention()
     except:
@@ -204,13 +223,17 @@ if "__main__" == __name__:
     with torch.no_grad():
         os.makedirs(output_dir, exist_ok=True)
 
-        for rgb_path in tqdm(rgb_filename_list, desc="Estimating depth", leave=True):
+        depth_image = Image.open(input_depth)
+        mask_image = Image.open(input_mask)
+        for rgb_path in tqdm(rgb_filename_list, desc=f"Estimating depth", leave=True):
             # Read input image
             input_image = Image.open(rgb_path)
 
             # Predict depth
             pipe_out = pipe(
                 input_image,
+                depth_image,
+                mask_image,
                 denoising_steps=denoise_steps,
                 ensemble_size=ensemble_size,
                 processing_res=processing_res,
