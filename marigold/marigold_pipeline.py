@@ -106,6 +106,8 @@ class MarigoldPipeline(DiffusionPipeline):
     def __call__(
         self,
         input_image: Image,
+        depth_image: Image,
+        mask_image: Image,
         denoising_steps: int = 10,
         ensemble_size: int = 10,
         processing_res: int = 768,
@@ -165,6 +167,13 @@ class MarigoldPipeline(DiffusionPipeline):
             input_image = resize_max_res(
                 input_image, max_edge_resolution=processing_res
             )
+            depth_image = resize_max_res(
+                depth_image, max_edge_resolution=processing_res
+            )
+        mask_image = resize_max_res(
+            mask_image, max_edge_resolution=processing_res
+        )
+        
         # Convert the image to RGB, to 1.remove the alpha channel 2.convert B&W to 3-channel
         input_image = input_image.convert("RGB")
         image = np.asarray(input_image)
@@ -176,10 +185,73 @@ class MarigoldPipeline(DiffusionPipeline):
         rgb_norm = rgb_norm.to(device)
         assert rgb_norm.min() >= 0.0 and rgb_norm.max() <= 1.0
 
+        # Masked Area
+        mask_image = mask_image.convert("RGB")
+        mask = np.asarray(mask_image)
+        mask = np.transpose(mask, (2, 0, 1))  # [H, W, rgb] -> [rgb, H, W]
+        mask = mask / 255.0
+        mask = torch.from_numpy(mask).to(self.dtype)
+        mask = mask.to(device)
+
+        #depth input
+        depth_image = depth_image
+        depth = np.asarray(depth_image)
+        depth = np.dstack([depth]*3)
+        print(depth.shape)
+        # print(depth)
+        depth = np.transpose(depth, (2, 0, 1))  # [H, W, rgb] -> [rgb, H, W]
+        depth = depth / (255.0)
+        depth = 1 - depth
+        depth = torch.from_numpy(depth).to(self.dtype)
+        depth = depth.to(device)
+
+        depth_to_save1 = (np.array(depth.cpu())*255).astype(np.uint8)
+        depth_to_save1 = np.transpose(depth_to_save1, (1, 2, 0))
+        Image.fromarray(depth_to_save1).save("save_depth_early.png")
+
+        # Initial depth map (noise)
+        mask = mask[None,:,:,:]
+        depth_masked = depth[None,:,:,:]
+
+        # Initial depth map (noise)
+        depth_noise = torch.randn(
+            [1, 4, 96, 96], device=device, dtype=self.dtype
+        )  # [B, 4, h, w]
+
+        depth_to_save2 = (np.array(depth_noise.cpu()) *255).astype(np.uint8)[0]
+        depth_to_save2 = np.transpose(depth_to_save2, (1, 2, 0))
+        Image.fromarray(depth_to_save2).save("save_noise_latent.png")
+
+        depth_noise = self.decode_depth_rgb(depth_noise)  
+
+        depth_to_save2 = (np.array(depth_noise.cpu()) *255).astype(np.uint8)[0]
+        depth_to_save2 = np.transpose(depth_to_save2, (1, 2, 0))
+        Image.fromarray(depth_to_save2).save("save_noise_pixel.png")
+
+        print(depth_noise.shape)
+        print(depth_masked.shape)
+        print(mask.shape)
+        depth_masked[ mask > 0 ] = depth_noise[ mask > 0 ]
+        # rgb_norm[ mask > 0 ]= depth_noise[ mask > 0 ]
+
+        depth_noise = self.encode_depth(depth_noise)  
+        
+        depth_to_save2 = (np.array(depth_noise.cpu()) *255).astype(np.uint8)[0]
+        depth_to_save2 = np.transpose(depth_to_save2, (1, 2, 0))
+        Image.fromarray(depth_to_save2).save("save_noise_latent_2.png")
+
+        depth_to_save2 = (np.array(depth_masked.cpu()) *255).astype(np.uint8)[0]
+        depth_to_save2 = np.transpose(depth_to_save2, (1, 2, 0))
+        Image.fromarray(depth_to_save2).save("save_depth.png")
+
+
+        # save test image?
+
         # ----------------- Predicting depth -----------------
         # Batch repeated input image
         duplicated_rgb = torch.stack([rgb_norm] * ensemble_size)
         single_rgb_dataset = TensorDataset(duplicated_rgb)
+
         if batch_size > 0:
             _bs = batch_size
         else:
@@ -188,7 +260,6 @@ class MarigoldPipeline(DiffusionPipeline):
                 input_res=max(rgb_norm.shape[1:]),
                 dtype=self.dtype,
             )
-
         single_rgb_loader = DataLoader(
             single_rgb_dataset, batch_size=_bs, shuffle=False
         )
@@ -196,15 +267,17 @@ class MarigoldPipeline(DiffusionPipeline):
         # Predict depth maps (batched)
         depth_pred_ls = []
         if show_progress_bar:
-            iterable = tqdm(
+            iterable1 = tqdm(
                 single_rgb_loader, desc=" " * 2 + "Inference batches", leave=False
             )
         else:
-            iterable = single_rgb_loader
-        for batch in iterable:
-            (batched_img,) = batch
-            depth_pred_raw = self.single_infer(
+            iterable1 = single_rgb_loader
+        for batch1 in iterable1:
+            (batched_img,) = batch1
+            depth_pred_raw = self.masked_single_infer(
                 rgb_in=batched_img,
+                # depth_in=depth_noise,
+                depth_in=depth_masked,
                 num_inference_steps=denoising_steps,
                 show_pbar=show_progress_bar,
             )
@@ -337,6 +410,75 @@ class MarigoldPipeline(DiffusionPipeline):
         depth = (depth + 1.0) / 2.0
 
         return depth
+    
+    @torch.no_grad()
+    def masked_single_infer(
+        self, rgb_in: torch.Tensor, depth_in: torch.Tensor, num_inference_steps: int, show_pbar: bool
+    ) -> torch.Tensor:
+        """
+        Perform an individual depth prediction without ensembling.
+
+        Args:
+            rgb_in (`torch.Tensor`):
+                Input RGB image.
+            num_inference_steps (`int`):
+                Number of diffusion denoisign steps (DDIM) during inference.
+            show_pbar (`bool`):
+                Display a progress bar of diffusion denoising.
+        Returns:
+            `torch.Tensor`: Predicted depth map.
+        """
+        device = rgb_in.device
+
+        # Set timesteps
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = self.scheduler.timesteps  # [T]
+
+        # Encode image
+        rgb_latent = self.encode_rgb(rgb_in)
+
+        depth_latent = self.encode_rgb(depth_in)  # [B, 4, h, w]
+
+        # Batched empty text embedding ? can this do anything?
+        if self.empty_text_embed is None:
+            self.__encode_empty_text()
+        batch_empty_text_embed = self.empty_text_embed.repeat(
+            (rgb_latent.shape[0], 1, 1)
+        )  # [B, 2, 1024]
+
+        # Denoising loop
+        if show_pbar:
+            iterable = tqdm(
+                enumerate(timesteps),
+                total=len(timesteps),
+                leave=False,
+                desc=" " * 4 + "Diffusion denoising",
+            )
+        else:
+            iterable = enumerate(timesteps)
+
+        for i, t in iterable:
+            unet_input = torch.cat(
+                [rgb_latent, depth_latent], dim=1
+            )  # this order is important
+
+            # predict the noise residual
+            noise_pred = self.unet(
+                unet_input, t, encoder_hidden_states=batch_empty_text_embed
+            ).sample  # [B, 4, h, w]
+
+            # compute the previous noisy sample x_t -> x_t-1
+            depth_latent = self.scheduler.step(noise_pred, t, depth_latent).prev_sample
+        torch.cuda.empty_cache()
+        depth = self.decode_depth(depth_latent)
+
+        # clip prediction
+        depth = torch.clip(depth, -1.0, 1.0)
+        # shift to [0, 1]
+        depth = (depth + 1.0) / 2.0
+
+        return depth
+
 
     def encode_rgb(self, rgb_in: torch.Tensor) -> torch.Tensor:
         """
@@ -356,6 +498,45 @@ class MarigoldPipeline(DiffusionPipeline):
         # scale latent
         rgb_latent = mean * self.rgb_latent_scale_factor
         return rgb_latent
+    
+    def encode_depth(self, depth_in: torch.Tensor) -> torch.Tensor:
+        """
+        Encode image into latent.
+
+        Args:
+            rgb_in (`torch.Tensor`):
+                Input Depth image to be encoded.
+
+        Returns:
+            `torch.Tensor`: Image latent.
+        """
+
+        # encode
+        h = self.vae.encoder(depth_in)
+        moments = self.vae.quant_conv(h)
+        mean, logvar = torch.chunk(moments, 2, dim=1)
+        # scale latent
+        depth_latent = mean * self.rgb_latent_scale_factor
+        return depth_latent
+
+    def decode_depth_rgb(self, depth_latent: torch.Tensor) -> torch.Tensor:
+        """
+        Decode depth latent into pixel space.
+
+        Args:
+            depth_latent (`torch.Tensor`):
+                Depth latent to be decoded.
+
+        Returns:
+            `torch.Tensor`: Decoded depth map.
+        """
+        # scale latent
+        depth_latent = depth_latent / self.rgb_latent_scale_factor
+        # decode
+        z = self.vae.post_quant_conv(depth_latent)
+        pixel_rgb = self.vae.decoder(z)
+        # mean of output channels
+        return pixel_rgb
 
     def decode_depth(self, depth_latent: torch.Tensor) -> torch.Tensor:
         """
@@ -376,3 +557,4 @@ class MarigoldPipeline(DiffusionPipeline):
         # mean of output channels
         depth_mean = stacked.mean(dim=1, keepdim=True)
         return depth_mean
+
